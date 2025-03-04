@@ -1,8 +1,11 @@
 from datetime import datetime
+import json
+import logging
 from decimal import Decimal
 from airflow.decorators import dag, task
 from airflow.providers.http.hooks.http import HttpHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.models import Variable
 
 @dag(
     schedule_interval="@hourly",
@@ -12,17 +15,29 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 )
 def order_conversion_dag():
     """
-    DAG to retrieve the latest exchange rates, convert order amounts to EUR,
-    and transfer data from the source orders database to the target processed orders database
+    DAG to use daily exchange rates for converting order amounts.
+    The exchange rates are fetched (via Open Exchange Rates API) only once per day,
+    and the same rates are reused by the hourly DAG runs.
     """
 
     @task()
     def get_exchange_rates() -> dict:
         """
-        Retrieve the latest exchange rates from OpenExchangeRates API using the HTTP hook
-        Normalize the rates so that every currency is expressed relative to EUR
+        Retrieve exchange rates from Open Exchange Rates API on a daily basis.
+        The exchange rates are stored in an Airflow Variable, so hourly runs reuse the
+        same data if the rates were already updated today.
         """
-        
+        current_day = datetime.now().strftime("%Y-%m-%d")
+        variable_name = "daily_exchange_rates"
+
+        try:
+            stored = Variable.get(variable_name, deserialize_json=True)
+            if stored.get("date") == current_day:
+                logging.info("Using cached exchange rates")
+                return stored.get("rates", {})
+        except KeyError:
+            pass
+
         http_hook = HttpHook(method="GET", http_conn_id="open_exchange_rates")
         conn = http_hook.get_connection("open_exchange_rates")
         endpoint = f"/api/latest.json?app_id={conn.password}"
@@ -40,16 +55,18 @@ def order_conversion_dag():
         eur_rate = usd_rates["EUR"]
         # Normalize rates to be relative to EUR
         normalized_rates = {currency: rate / eur_rate for currency, rate in usd_rates.items()}
-        
+
+        rates_data = {"date": current_day, "rates": normalized_rates}
+        Variable.set(variable_name, json.dumps(rates_data))
+
         return normalized_rates
 
     @task()
     def transfer_and_convert_orders(exchange_rates: dict) -> str:
         """
-        Connect to the source and target PostgreSQL databases using the Postgres hook
-        Fetch unprocessed orders from the source database, mark them as processed,
-        convert the order amounts to EUR using the provided exchange rates,
-        and insert the converted orders into the target database
+        Connect to the source and target PostgreSQL databases, fetch unprocessed orders,
+        mark them as processed, convert the order amounts to EUR using the provided exchange rates,
+        and insert the converted orders into the target database.
         """
         conversion_time = datetime.now()
 

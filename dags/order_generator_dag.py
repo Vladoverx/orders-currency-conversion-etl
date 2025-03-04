@@ -3,11 +3,11 @@ import uuid
 import random
 import string
 import logging
-
+import json
 from airflow.decorators import dag, task
 from airflow.providers.http.hooks.http import HttpHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-
+from airflow.models import Variable
 
 @dag(
     schedule_interval="*/10 * * * *",
@@ -26,6 +26,16 @@ def generate_orders_dag():
         """
         Fetch a list of available currencies using the HTTP hook
         """
+        current_day = datetime.now().strftime("%Y-%m-%d")
+        variable_name = "daily_currencies"
+        try:
+            stored = Variable.get(variable_name, deserialize_json=True)
+            if stored.get("date") == current_day:
+                logging.info("Using cached currencies")
+                return stored.get("currencies", {})
+        except KeyError:
+            pass
+        
         http_hook = HttpHook(method="GET", http_conn_id="open_exchange_rates")
         conn = http_hook.get_connection("open_exchange_rates")
         endpoint = f"/api/currencies.json?app_id={conn.password}"
@@ -37,6 +47,10 @@ def generate_orders_dag():
         data = response.json()
         currencies = list(data.keys())
         logging.info("Fetched currencies: %s", currencies)
+        
+        rates_data = {"date": current_day, "currencies": currencies}
+        Variable.set(variable_name, json.dumps(rates_data))
+
         return currencies
 
     @task()
