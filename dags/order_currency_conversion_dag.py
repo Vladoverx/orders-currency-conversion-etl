@@ -2,10 +2,13 @@ from datetime import datetime
 import json
 import logging
 from decimal import Decimal
+import pandas as pd
 from airflow.decorators import dag, task
 from airflow.providers.http.hooks.http import HttpHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.models import Variable
+from sqlalchemy import create_engine
+from airflow.exceptions import AirflowException
 
 @dag(
     schedule_interval="@hourly",
@@ -69,75 +72,113 @@ def order_conversion_dag():
         and insert the converted orders into the target database.
         """
         conversion_time = datetime.now()
-
         source_hook = PostgresHook(postgres_conn_id="postgres_orders")
         target_hook = PostgresHook(postgres_conn_id="postgres_processed_orders_eur")
+        
+        source_conn = source_hook.get_conn()
+        target_conn = target_hook.get_conn()
+        
+        try:
+            source_conn.autocommit = False
+            target_conn.autocommit = False
+            source_cursor = source_conn.cursor()
+            
+            # Retrieve unprocessed orders with FOR UPDATE to lock the rows
+            select_sql = """
+                SELECT order_id, customer_email, order_date, amount, currency
+                FROM orders
+                WHERE processed_at IS NULL
+                LIMIT 30000
+                FOR UPDATE
+            """
+            source_cursor.execute(select_sql)
+            orders = source_cursor.fetchall()
+            
+            if not orders:
+                source_conn.rollback()
+                return "No new orders to process."
+            
+            orders_df = pd.DataFrame(orders, columns=[
+                "order_id", "customer_email", "order_date", "amount", "currency"
+            ])
+            
+            def convert_to_eur(row: pd.Series):
+                if row["currency"] == "EUR":
+                    return row["amount"], 1.0
+                rate = exchange_rates.get(row["currency"], 1.0)
+                eur_amount = round(row["amount"] / Decimal(str(rate)), 2)
+                return eur_amount, rate
+            
+            orders_df[["amount_eur", "exchange_rate"]] = orders_df.apply(
+                convert_to_eur, axis=1, result_type="expand"
+            )
 
-        # Retrieve unprocessed orders
-        select_sql = """
-            SELECT order_id, customer_email, order_date, amount, currency
-            FROM orders
-            WHERE processed_at IS NULL
-        """
-        orders = source_hook.get_records(select_sql)
-
-        if not orders:
-            return "No new orders to process."
-
-        # Extract order IDs and update processed_at in the source database
-        order_ids = [order[0] for order in orders]
-        update_sql = """
-            UPDATE orders
-            SET processed_at = %s
-            WHERE order_id = ANY(%s::uuid[])
-        """
-        source_hook.run(update_sql, parameters=(conversion_time, order_ids))
-
-        rows_to_insert = []
-        for order in orders:
-            order_id, email, order_date, amount, currency = order
-
-            if currency == "EUR":
-                eur_amount = amount
-                rate = 1.0
-            else:
-                rate = exchange_rates.get(currency, 1.0)
-                if rate == 1.0:
-                    eur_amount = amount
-                else:
-                    eur_amount = round(amount / Decimal(rate), 2)
-
-            rows_to_insert.append((
-                order_id,
-                email,
-                order_date,
-                amount,
-                currency,
-                eur_amount,
-                rate,
-                conversion_time
-            ))
-
-        target_hook.insert_rows(
-            table="orders_eur",
-            rows=rows_to_insert,
-            target_fields=[
-                "order_id",
-                "customer_email",
-                "order_date",
-                "original_amount",
-                "original_currency",
-                "amount_eur",
-                "exchange_rate",
-                "exchange_rate_date"
-            ],
-            commit_every=5000
-        )
-        return f"Processed {len(orders)} orders."
+            orders_df["exchange_rate_date"] = conversion_time
+            orders_df["original_amount"] = orders_df["amount"]
+            orders_df["original_currency"] = orders_df["currency"]
+            
+            target_df = orders_df[[
+                "order_id", "customer_email", "order_date", 
+                "original_amount", "original_currency", 
+                "amount_eur", "exchange_rate", "exchange_rate_date"
+            ]]
+            
+            try:
+                target_engine = create_engine(target_hook.get_uri())
+                target_df.to_sql(
+                    "orders_eur", 
+                    target_engine, 
+                    if_exists="append", 
+                    index=False,
+                    method="multi",
+                    chunksize=1000
+                )
+            except Exception as e:
+                source_conn.rollback()
+                target_conn.rollback()
+                raise Exception(f"Failed to insert into target database: {e}")
+            
+            # Then, update the source database
+            try:
+                order_ids = orders_df["order_id"].tolist()
+                placeholders = ",".join(["%s"] * len(order_ids))
+                update_sql = f"""
+                    UPDATE orders
+                    SET processed_at = %s
+                    WHERE order_id in ({placeholders})
+                """
+                source_cursor.execute(update_sql, [conversion_time] + order_ids)
+            except Exception as e:
+                source_conn.rollback()
+                target_conn.rollback()
+                raise Exception(f"Failed to update source database: {e}")
+            
+            target_conn.commit()
+            source_conn.commit()
+            
+            return f"Processed {len(orders)} orders."
+        
+        except Exception as e:
+            try:
+                target_conn.rollback()
+            except Exception:
+                pass
+            
+            try:
+                source_conn.rollback()
+            except Exception:
+                pass
+                
+            logging.error(f"Error processing orders: {e}")
+            raise AirflowException(f"Error processing orders: {e}")
+        
+        finally:
+            source_conn.close()
+            target_conn.close()
 
     rates = get_exchange_rates()
     result = transfer_and_convert_orders(rates)
     
     rates >> result
-
+    
 order_conversion_dag_instance = order_conversion_dag()
