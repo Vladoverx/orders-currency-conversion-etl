@@ -1,6 +1,6 @@
-# Orders Currency Conversion ETL
+# Basic Orders Currency Conversion ETL Example
 ## Overview
-This project implements an ETL pipeline to process order data with currency conversions using Apache Airflow. The pipeline automates the process of converting order amounts to the single currency Euro using current exchange rates.
+An ETL pipeline to process generated order data with currency conversions using Apache Airflow. The pipeline automates the process of converting order amounts to the single currency Euro using current exchange rates.
 
 ### Configure Airflow Connections
 
